@@ -95,6 +95,7 @@ R3Grid(const R3Box& bbox, RNLength spacing, int min_resolution, int max_resoluti
     inflated_bbox[1] += spacing * min_border * R3ones_vector;
   }
   
+  // max resolution and min resolution cannot be enforced simultaneously 
   // Enforce max resolution
   if (max_resolution > 0) {
     if (inflated_bbox.XLength() / spacing > max_resolution) spacing = inflated_bbox.XLength() / max_resolution;

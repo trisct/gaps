@@ -19,7 +19,10 @@ static char *output_points_filename = NULL;
 static double target_grid_spacing = 0.01;  // in world units
 static R3Box grid_bbox(FLT_MAX, FLT_MAX, FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX);
 static double grid_border = 3; // in grid units
+static int grid_min_resolution = 5; // in grid units
 static int grid_max_resolution = 512; // in grid units
+static int grid_iso_resolution = -1;
+static double margin_percentage = 0.;
 static int refinement_radius = 9; // in grid units
 static double truncation_distance = RN_INFINITY; // in world units
 static int estimate_sign = FALSE;
@@ -918,6 +921,42 @@ static int
 ParseArgs(int argc, char **argv)
 {
   // Parse arguments
+  int nargs = 21;
+  char * option_list[nargs] = {};
+  
+  option_list[0]  = "Usage: msh2df inputmeshfile outputgridfile [options]\n";
+  option_list[1]  = "-v                                 verbose\n";
+  option_list[2]  = "-debug                             debugging mode\n";
+  option_list[3]  = "-estimate_sign                     action=store_true\n";
+  option_list[4]  = "-estimate_sign_using_normals       action=store_true\n";
+  option_list[5]  = "-estimate_sign_using_flood_fill    action=store_true\n";
+  option_list[6]  = "-sign_estimation_method            ***\n";
+  option_list[7]  = "-truncation_distance               ***\n";
+  option_list[8]  = "-spacing                           <double>\n";
+  option_list[9]  = "-border                            ***\n";
+  option_list[11] = "-max_resolution                    <int>\n";
+  option_list[10] = "-min_resolution                    <int> note that this overrides the max_resolution option\n";
+  option_list[12] = "-iso_resolution                    <int> forces all dimentions to have the same resolution. The bounding box will be set to an axis-aligned, symmetric cube containing the mesh. Better make sure the mesh is centered at the origin before running this program. Note that this overrides both min_resolution and max_resolution options\n";
+  option_list[13] = "-margin_percentage                 <double> Adds a margin to the bbox by this percentage. Only works when -iso_resolution is specified. For example, if the bbox along x is [-1,1] and margin_percentage == .2, then the resulting bbox along x is [-1.2,1.2]\n";
+  option_list[14] = "-refinement_radius                 ***\n";
+  option_list[15] = "-output_mesh                       ***\n";
+  option_list[16] = "-output_points                     ***\n";
+  option_list[17] = "-input_is_manifold                 ***\n";
+  option_list[18] = "-input_is_range_scan               ***\n";
+  option_list[19] = "-scan_viewpoint                    ***\n";
+  option_list[20] = "-bbox                              ***\n";
+
+  int msg_len = 0;
+  for(int i=0; i<nargs; i++) {
+      msg_len += strlen(option_list[i]);
+  }
+  msg_len += 256;
+  char * options_msg = new char[msg_len];
+  options_msg[0] = '\0';
+  for(int i=0; i<nargs; i++) {
+      strcat(options_msg, option_list[i]);
+  }
+
   argc--; argv++;
   while (argc > 0) {
     if ((*argv)[0] == '-') {
@@ -930,7 +969,10 @@ ParseArgs(int argc, char **argv)
       else if (!strcmp(*argv, "-truncation_distance")) { argc--; argv++; truncation_distance = atof(*argv); }
       else if (!strcmp(*argv, "-spacing")) { argc--; argv++; target_grid_spacing = atof(*argv); }
       else if (!strcmp(*argv, "-border")) { argc--; argv++; grid_border = atof(*argv); }
+      else if (!strcmp(*argv, "-min_resolution")) { argc--; argv++; grid_min_resolution = atoi(*argv); }
       else if (!strcmp(*argv, "-max_resolution")) { argc--; argv++; grid_max_resolution = atoi(*argv); }
+      else if (!strcmp(*argv, "-iso_resolution")) { argc--; argv++; grid_iso_resolution = atoi(*argv); }
+      else if (!strcmp(*argv, "-margin_percentage")) { argc--; argv++; margin_percentage = atof(*argv); }
       else if (!strcmp(*argv, "-refinement_radius")) { argc--; argv++; refinement_radius = atoi(*argv); }
       else if (!strcmp(*argv, "-output_mesh")) { argc--; argv++; output_mesh_filename = *argv; }
       else if (!strcmp(*argv, "-output_points")) { argc--; argv++; output_points_filename = *argv; }
@@ -950,21 +992,22 @@ ParseArgs(int argc, char **argv)
         argc--; argv++; grid_bbox[1][2] = atof(*argv);
       }
       else {
-        RNFail("Invalid program argument: %s", *argv);
+        RNFail("Invalid program argument: %s. Type the command with no argument to see its usage.", *argv);
         exit(1);
       }
     }
     else {
       if (!input_mesh_filename) input_mesh_filename = *argv;
       else if (!output_grid_filename) output_grid_filename = *argv;
-      else { RNFail("Invalid program argument: %s", *argv); exit(1); }
+      else { RNFail("Invalid program argument: %s. Type the command with no argument to see its usage.", *argv); exit(1); }
     }
     argv++; argc--;
   }
 
   // Check filenames
   if (!input_mesh_filename || !output_grid_filename) {
-    RNFail("Usage: msh2df inputmeshfile outputgridfile [options]\n");
+    //RNFail("Usage: msh2df inputmeshfile outputgridfile [options]\n");
+    RNFail(options_msg);
     return 0;
   }
 
@@ -973,7 +1016,8 @@ ParseArgs(int argc, char **argv)
     refinement_radius = 3;
   }
 
-  // Return OK status 
+  // Return OK status
+  delete [] options_msg;
   return 1;
 }
 
@@ -983,8 +1027,7 @@ ParseArgs(int argc, char **argv)
 // Main program
 ////////////////////////////////////////////////////////////////////////
 
-int 
-main(int argc, char **argv)
+int main(int argc, char **argv)
 {
   // Parse program arguments
   if (!ParseArgs(argc, argv)) exit(-1);
@@ -994,12 +1037,58 @@ main(int argc, char **argv)
   if (!mesh) exit(-1);
 
   // Update program arguments based on mesh properties
-  if (grid_bbox.IsEmpty()) grid_bbox = mesh->BBox();
+
+  RNCoord max_coord;
+  RNCoord min_coord;
+  if (grid_bbox.IsEmpty()) {
+      grid_bbox = mesh->BBox();
+      if (print_verbose) {
+          printf("[HERE: In msh2df] --grid_bbox not specified, using mesh bbox:\n");
+          printf("[HERE: In msh2df] | [%.4f, %.4f] x [%.4f, %.4f] x [%.4f, %.4f]\n", grid_bbox.XMin(), grid_bbox.XMax(), grid_bbox.YMin(), grid_bbox.YMax(), grid_bbox.ZMin(), grid_bbox.ZMax());
+      }
+      if (grid_iso_resolution != -1) {
+          max_coord = std::max(std::max(grid_bbox.XMax(), grid_bbox.YMax()), grid_bbox.ZMax());
+          min_coord = std::min(std::min(grid_bbox.XMin(), grid_bbox.YMin()), grid_bbox.ZMin());
+          grid_bbox = R3Box(min_coord, min_coord, min_coord, max_coord, max_coord, max_coord);
+          if (print_verbose) {
+            printf("[HERE: In msh2df] --iso_resolution specified, using isotropic bbox:\n");
+            printf("[HERE: In msh2df] | [%.4f, %.4f] x [%.4f, %.4f] x [%.4f, %.4f]\n", grid_bbox.XMin(), grid_bbox.XMax(), grid_bbox.YMin(), grid_bbox.YMax(), grid_bbox.ZMin(), grid_bbox.ZMax());
+          }
+        
+            if (margin_percentage > 0.) {
+                min_coord *= (margin_percentage + 1);
+                max_coord *= (margin_percentage + 1);
+                grid_bbox = R3Box(min_coord, min_coord, min_coord, max_coord, max_coord, max_coord);
+                
+                if (print_verbose) {
+                    printf("[HERE: In msh2df] --margin_percentage specified, add a %.4f percent margin:\n", margin_percentage);
+                    printf("[HERE: In msh2df] | Resulting bbox is\n");
+                    printf("[HERE: In msh2df] | [%.4f, %.4f] x [%.4f, %.4f] x [%.4f, %.4f]\n", grid_bbox.XMin(), grid_bbox.XMax(), grid_bbox.YMin(), grid_bbox.YMax(), grid_bbox.ZMin(), grid_bbox.ZMax());
+                }
+            }
+    }
+  else {
+      if (print_verbose) {
+          printf("[HERE: In msh2df] grid_bbox is not empty, using bbox:\n");
+          printf("[HERE: In msh2df] | [%.4f, %.4f] x [%.4f, %.4f] x [%.4f, %.4f]\n", grid_bbox.XMin(), grid_bbox.XMax(), grid_bbox.YMin(), grid_bbox.YMax(), grid_bbox.ZMin(), grid_bbox.ZMax());
+      }
+  }
+
+  }
+
+
   if (IsManifold(mesh)) input_is_manifold = TRUE;
   if (input_is_manifold) sign_estimation_method = 1;
 
   // Initialize grid with appropriate dimensions
-  R3Grid grid(grid_bbox, target_grid_spacing, 5, grid_max_resolution, grid_border);
+  R3Grid grid;
+  if (grid_iso_resolution == -1) {
+      grid = R3Grid(grid_bbox, target_grid_spacing, grid_min_resolution, grid_max_resolution, grid_border);
+  }
+  else {
+      grid = R3Grid(grid_iso_resolution, grid_iso_resolution, grid_iso_resolution, grid_bbox);
+  }
+  
 
   // Estimate distance
   if (!EstimateDistanceUsingGrid(&grid, mesh)) return 0;
